@@ -1,0 +1,211 @@
+import argparse
+import os
+from pathlib import Path
+import sys
+import torch
+from torch.utils.data import DataLoader
+
+REPO_ROOT = Path(__file__).parent
+sys.path.insert(0, str(REPO_ROOT / "trajectory-transformer"))
+sys.path.insert(0, str(REPO_ROOT / "suffix-prediction"))
+
+from trajectory.models.transformers import GPT
+from dfa_adapter import TTDFAAdapter
+from logic_loss_tt import LogicLossModule
+from cb_dataset import CBSequenceDataset
+from DeepAutoma import DeepDFA
+
+if torch.cuda.is_available():
+    device = 'cuda:0'
+else:
+    device = 'cpu'
+
+
+def build_adapter_and_dfa(args, dataset):
+    """
+    Build TTDFAAdapter + DeepDFA for Colour Bomb.
+
+    We treat:
+        - one observation dim with cardinality = env.n_states
+        - one action dim with cardinality = env.action_space.n
+        - one reward dim with 1 bin (always 0 for now)
+        - one value dim  with 1 bin (always 0 for now)
+
+    This yields an identity mapping for state/action tokens.
+    """
+    env = dataset.env
+    obs_bins = env.observation_space.n
+    act_bins = env.action_space.n
+    rew_bins = 1
+    val_bins = 1
+
+    num_bins_per_dim = [obs_bins, act_bins, rew_bins, val_bins]
+
+    adapter = TTDFAAdapter(
+        observation_dim=dataset.observation_dim,
+        action_dim=dataset.action_dim,
+        num_bins=num_bins_per_dim,
+        include_reward=True,
+        include_value=True,
+        constraint_dims=args.constraint_dims,
+        abstraction_fn=None,
+        use_stop_token=False,
+    )
+
+    if args.ltl_formula is None:
+        raise ValueError("You must provide --ltl_formula")
+
+    dfa = adapter.create_dfa_from_ltl(args.ltl_formula, "cb_constraint")
+    deep_dfa = DeepDFA.return_deep_dfa(dfa)
+    return adapter, deep_dfa
+
+
+def build_model(args, dataset, vocab_size):
+    """
+    Build a GPT model configured for the Colour Bomb dataset and adapter.
+    """
+    class Cfg:
+        pass
+
+    cfg = Cfg()
+    cfg.vocab_size = vocab_size
+    cfg.block_size = args.block_size
+    cfg.n_layer = args.n_layer
+    cfg.n_head = args.n_head
+    cfg.n_embd = args.n_embd
+    cfg.observation_dim = dataset.observation_dim
+    cfg.action_dim = dataset.action_dim
+    cfg.transition_dim = dataset.joined_dim
+    cfg.action_weight = args.action_weight
+    cfg.reward_weight = args.reward_weight
+    cfg.value_weight = args.value_weight
+    cfg.embd_pdrop = args.embd_pdrop
+    cfg.resid_pdrop = args.resid_pdrop
+    cfg.attn_pdrop = args.attn_pdrop
+
+    model = GPT(cfg).to(device)
+    return model
+
+
+def train(args):
+    dataset = CBSequenceDataset(
+        num_episodes=args.num_episodes, max_steps=args.max_steps,
+        sequence_length=args.block_size, discount=args.discount,
+        stochastic=args.stochastic, seed=args.seed
+    )
+
+    loader = DataLoader(
+        dataset, batch_size=args.batch_size, shuffle=True, drop_last=True
+    )
+
+    adapter, deep_dfa = build_adapter_and_dfa(args, dataset)
+    model = build_model(args, dataset, vocab_size=adapter.num_token_ids)
+
+    logic = LogicLossModule(
+        deep_dfa=deep_dfa, adapter=adapter, mode='global',
+        num_samples=args.num_samples, temperature=args.temperature, alpha=args.alpha,
+    )
+
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    for epoch in range(args.epochs):
+        model.train()
+        total_loss = 0.0
+        total_sup = 0.0
+        total_log = 0.0
+        n_batches = 0
+
+        for batch in loader:
+            batch = [b.to(device) for b in batch]
+            loss, sup_loss, logic_loss = logic.compute_loss(
+                model, batch, return_components=True
+            )
+
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            opt.step()
+
+            total_loss += loss.item()
+            total_sup += sup_loss.item()
+            total_log += logic_loss.item()
+            n_batches += 1
+
+        print(
+            "epoch %d | loss %.4f | sup %.4f | logic %.4f"
+            % (
+                epoch,
+                total_loss / max(1, n_batches),
+                total_sup / max(1, n_batches),
+                total_log / max(1, n_batches),
+            )
+        )
+
+        if args.save_path is not None:
+            os.makedirs(args.save_path, exist_ok=True)
+            ckpt_path = os.path.join(args.save_path, "cb_state_%d.pt" % epoch)
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "config": {
+                        "vocab_size": adapter.num_token_ids,
+                        "block_size": args.block_size,
+                        "n_layer": args.n_layer,
+                        "n_head": args.n_head,
+                        "n_embd": args.n_embd,
+                        "observation_dim": dataset.observation_dim,
+                        "action_dim": dataset.action_dim,
+                        "transition_dim": dataset.joined_dim,
+                        "action_weight": args.action_weight,
+                        "reward_weight": args.reward_weight,
+                        "value_weight": args.value_weight,
+                        "embd_pdrop": args.embd_pdrop,
+                        "resid_pdrop": args.resid_pdrop,
+                        "attn_pdrop": args.attn_pdrop
+                    }
+                },
+                ckpt_path,
+            )
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+
+    p.add_argument("--num_episodes", type=int, default=2000)
+    p.add_argument("--max_steps", type=int, default=200)
+    p.add_argument("--block_size", type=int, default=128)
+    p.add_argument("--discount", type=float, default=0.99)
+    p.add_argument("--stochastic", action="store_true")
+    p.add_argument("--seed", type=int, default=0)
+
+    p.add_argument("--n_layer", type=int, default=4)
+    p.add_argument("--n_head", type=int, default=4)
+    p.add_argument("--n_embd", type=int, default=64)
+    p.add_argument("--embd_pdrop", type=float, default=0.1)
+    p.add_argument("--resid_pdrop", type=float, default=0.1)
+    p.add_argument("--attn_pdrop", type=float, default=0.1)
+
+    p.add_argument("--action_weight", type=float, default=1.0)
+    p.add_argument("--reward_weight", type=float, default=0.0)
+    p.add_argument("--value_weight", type=float, default=0.0)
+
+    p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--grad_clip", type=float, default=1.0)
+
+    p.add_argument("--ltl_formula", type=str, required=True)
+    p.add_argument("--constraint_dims", type=int, nargs="+", default=[0])
+
+    p.add_argument("--num_samples", type=int, default=10)
+    p.add_argument("--temperature", type=float, default=0.5)
+    p.add_argument("--alpha", type=float, default=0.4)
+
+    p.add_argument("--save_path", type=str, default="cb_runs")
+
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    train(args)
