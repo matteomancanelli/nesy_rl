@@ -49,9 +49,16 @@ def test_adapter_and_dfa():
         include_value=True,
         use_stop_token=True,
     )
-    # simple DFA: accept if first symbol is s0_bin0 and end afterward
-    dfa = adapter.create_dfa_from_ltl("s0_bin0", "test")
-    tokens = torch.tensor([[0, adapter.num_token_ids - 1, adapter.num_token_ids - 1]])
+    # manual DFA: accept if first symbol is s0_bin0, otherwise reject
+    sym_idx = adapter.symbolic_vocab.index("s0_bin0")
+    num_syms = adapter.num_symbols
+    transitions = {
+        0: {s: (1 if s == sym_idx else 0) for s in range(num_syms)},
+        1: {s: 1 for s in range(num_syms)},
+    }
+    acceptance = [False, True]
+    dfa = DFA(transitions, acceptance, None, dictionary_symbols=adapter.symbolic_vocab)
+    tokens = torch.tensor([[0]])  # first token s0_bin0
     sat = adapter.batch_check_dfa_sat(tokens, dfa)
     return {"adapter_num_tokens": adapter.num_token_ids, "sat": sat.item(), "tokens": tokens.tolist()}
 
