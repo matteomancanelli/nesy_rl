@@ -27,7 +27,7 @@ def dataset_split(dataset, val_ratio=0.1, test_ratio=0.1, seed=0):
     return torch.utils.data.Subset(dataset, train_idx), torch.utils.data.Subset(dataset, val_idx), torch.utils.data.Subset(dataset, test_idx)
 
 
-def eval_model(model, adapter, dfa, loader, device):
+def eval_model(model, adapter, dfa, loader, device, mask_to_state_only=False):
     model.eval()
     total_loss = 0.0
     total_batches = 0
@@ -41,10 +41,10 @@ def eval_model(model, adapter, dfa, loader, device):
             logits, sup_loss = model(x, targets=y, mask=mask)
             preds = logits.argmax(dim=-1)
             if isinstance(dfa, (list, tuple)):
-                sats = [adapter.batch_check_dfa_sat(preds, d) for d in dfa]
+                sats = [adapter.batch_check_dfa_sat(preds, d, mask_to_state_only=mask_to_state_only) for d in dfa]
                 sat = torch.stack(sats, dim=0).min(dim=0).values
             else:
-                sat = adapter.batch_check_dfa_sat(preds, dfa)
+                sat = adapter.batch_check_dfa_sat(preds, dfa, mask_to_state_only=mask_to_state_only)
             violations = (sat < 0.5).sum().item()
 
             total_loss += sup_loss.item()
@@ -90,12 +90,12 @@ def train_model(args, device):
             n_batches += 1
 
         if (epoch + 1) % args.eval_every == 0:
-            val_metrics = eval_model(model, adapter, raw_dfa, val_loader, device)
+            val_metrics = eval_model(model, adapter, raw_dfa, val_loader, device, mask_to_state_only=args.mask_to_state_only)
             print(f"epoch {epoch}: train_loss={total_loss/max(1,n_batches):.4f} val_loss={val_metrics['supervised_loss']:.4f} sat={val_metrics['satisfaction_rate']:.3f}")
 
     # final eval
-    val_metrics = eval_model(model, adapter, raw_dfa, val_loader, device)
-    test_metrics = eval_model(model, adapter, raw_dfa, test_loader, device)
+    val_metrics = eval_model(model, adapter, raw_dfa, val_loader, device, mask_to_state_only=args.mask_to_state_only)
+    test_metrics = eval_model(model, adapter, raw_dfa, test_loader, device, mask_to_state_only=args.mask_to_state_only)
     return model, adapter, raw_dfa, val_metrics, test_metrics
 
 
@@ -106,6 +106,7 @@ def parse_eval_args():
     parser.add_argument("--test_ratio", type=float, default=0.1)
     parser.add_argument("--eval_every", type=int, default=5)
     parser.add_argument("--out_dir", type=str, default="eval_runs")
+    parser.add_argument("--mask_to_state_only", action="store_true", help="Only consider state symbols for DFA satisfaction")
     return parser
 
 

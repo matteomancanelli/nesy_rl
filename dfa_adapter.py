@@ -311,7 +311,7 @@ class TTDFAAdapter:
 
         return indices
 
-    def batch_check_dfa_sat(self, token_sequences, dfa):
+    def batch_check_dfa_sat(self, token_sequences, dfa, mask_to_state_only=False):
         """
         Check DFA satisfaction for a batch of token sequences.
 
@@ -320,6 +320,9 @@ class TTDFAAdapter:
                 tensor of shape [batch_size, seq_len] with integer token IDs.
             dfa:
                 DFA with method accepts_from_state(initial_state, indices).
+            mask_to_state_only:
+                if True, zero out tokens at non-state positions (maps to s0_bin0/end),
+                useful for formulas that only mention s0_* symbols.
 
         Returns:
             Tensor of shape [batch_size], dtype float32, with 1.0 if accepted, 0.0 otherwise.
@@ -331,6 +334,16 @@ class TTDFAAdapter:
         token_sequences = token_sequences.long()
         batch_size = token_sequences.shape[0]
         satisfaction = torch.zeros(batch_size, dtype=torch.float32, device=device)
+
+        if mask_to_state_only:
+            # zero out non-state positions so only s0_* symbols appear
+            seq_len = token_sequences.shape[1]
+            positions = torch.arange(seq_len, device=token_sequences.device)
+            pos_mod = positions % self.transition_dim
+            state_positions = pos_mod == 0  # position 0 corresponds to first scalar (state)
+            masked = token_sequences.clone()
+            masked[:, ~state_positions] = 0  # maps to s0_bin0
+            token_sequences = masked
 
         symbol_sequences = self.tokens_to_symbols(token_sequences)
         if isinstance(symbol_sequences, list) and symbol_sequences and isinstance(symbol_sequences[0], str):
