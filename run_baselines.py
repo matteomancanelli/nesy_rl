@@ -12,7 +12,7 @@ from train_cb import (
 )
 
 
-def run_baseline(name, args):
+def run_baseline(name, args, alpha_override=None, suffix=None):
     """Train a single baseline and optionally evaluate it."""
     cfg = copy.deepcopy(args)
     if name == "vanilla":
@@ -23,7 +23,10 @@ def run_baseline(name, args):
     else:
         raise ValueError(f"Unknown baseline '{name}'")
 
-    cfg.save_path = os.path.join(args.base_save_path, name)
+    if alpha_override is not None:
+        cfg.alpha = alpha_override
+    tag = name if suffix is None else f"{name}_{suffix}"
+    cfg.save_path = os.path.join(args.base_save_path, tag)
 
     # Train and keep the objects for evaluation
     model, adapter, deep_dfa, dataset, raw_dfa = train(cfg, return_state=True)
@@ -65,6 +68,13 @@ def parse_baseline_args():
         default=128,
         help="Batch size for evaluation",
     )
+    parser.add_argument(
+        "--alphas",
+        type=float,
+        nargs="+",
+        default=[0.4],
+        help="Logic loss weights to sweep for logic baseline",
+    )
     return parser
 
 
@@ -74,9 +84,15 @@ def main():
 
     results = {}
     for name in args.baselines:
-        print(f"=== Running baseline: {name} ===")
-        metrics = run_baseline(name, args)
-        results[name] = metrics
+        if name == "logic" and args.alphas:
+            for a in args.alphas:
+                print(f"=== Running baseline: {name} alpha={a} ===")
+                metrics = run_baseline(name, args, alpha_override=a, suffix=f"alpha{a}")
+                results[f"{name}_alpha{a}"] = metrics
+        else:
+            print(f"=== Running baseline: {name} ===")
+            metrics = run_baseline(name, args)
+            results[name] = metrics
 
     if results:
         summary_path = os.path.join(args.base_save_path, "baseline_metrics.json")
