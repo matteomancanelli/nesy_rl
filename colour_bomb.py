@@ -1,16 +1,20 @@
 import numpy as np
 
 try:
-    import gym
-    from gym import spaces
+    import gymnasium as gym
+    from gymnasium import spaces
 except ImportError:
-    class spaces:
-        class Discrete:
-            def __init__(self, n):
-                self.n = n
+    try:
+        import gym
+        from gym import spaces
+    except ImportError:
+        class spaces:
+            class Discrete:
+                def __init__(self, n):
+                    self.n = n
 
-    class gym:
-        Env = object
+        class gym:
+            Env = object
 
 
 class CBConfig:

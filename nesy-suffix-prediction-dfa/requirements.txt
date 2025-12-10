@@ -1,0 +1,10 @@
+networkx==3.4.2
+pydot==4.0.1
+numpy==2.2.6
+jellyfish==1.2.0
+pm4py==2.7.16
+torch==2.7.1
+torchmetrics==1.7.4
+torch-geometric==2.6.1
+matplotlib==3.10.3
+seaborn==0.13.2

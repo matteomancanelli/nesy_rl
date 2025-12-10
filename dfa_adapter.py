@@ -271,9 +271,11 @@ class TTDFAAdapter:
         batch_size, seq_len, num_token_ids = token_probs.shape
         sym_probs = token_probs.new_zeros(batch_size, seq_len, self.num_symbols)
 
+        pos_bin_to_sym_idx = self.pos_bin_to_sym_idx.to(token_probs.device)
+
         for t in range(seq_len):
             pos = t % self.transition_dim
-            sym_idx_row = self.pos_bin_to_sym_idx[pos]  # [num_token_ids]
+            sym_idx_row = pos_bin_to_sym_idx[pos]  # [num_token_ids]
             idx = sym_idx_row.unsqueeze(0).expand(batch_size, num_token_ids)
             sym_probs[:, t, :].scatter_add_(1, idx, token_probs[:, t, :])
 
@@ -283,14 +285,10 @@ class TTDFAAdapter:
         """
         Build a DFA from an LTL formula using the current symbolic vocabulary.
         """
-        
-        dfa = DFA(
-            formula=ltl_formula,
-            numb_of_symbols=self.num_symbols,
-            name=formula_name,
-            dictionary_symbols=self.symbolic_vocab,
-        )
-        
+
+        # FiniteStateMachine.DFA signature is (ltl_formula, num_symbols, name, dictionary_symbols)
+        dfa = DFA(ltl_formula, self.num_symbols, formula_name, dictionary_symbols=self.symbolic_vocab)
+
         return dfa
 
     def _symbols_to_dfa_indices(self, symbol_seq, dfa):

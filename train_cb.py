@@ -49,14 +49,15 @@ def build_adapter_and_dfa(args, dataset):
         include_value=True,
         constraint_dims=args.constraint_dims,
         abstraction_fn=None,
-        use_stop_token=False,
+        use_stop_token=True,
     )
 
     if args.ltl_formula is None:
         raise ValueError("You must provide --ltl_formula")
 
     dfa = adapter.create_dfa_from_ltl(args.ltl_formula, "cb_constraint")
-    deep_dfa = DeepDFA.return_deep_dfa(dfa)
+    # FiniteStateMachine.DFA exposes return_deep_dfa as an instance method
+    deep_dfa = dfa.return_deep_dfa()
     return adapter, deep_dfa
 
 
@@ -99,7 +100,8 @@ def train(args):
     )
 
     adapter, deep_dfa = build_adapter_and_dfa(args, dataset)
-    model = build_model(args, dataset, vocab_size=adapter.num_token_ids)
+    # GPT expects vocab_size without the extra stop token it appends internally
+    model = build_model(args, dataset, vocab_size=adapter.num_token_ids - 1)
 
     logic = LogicLossModule(
         deep_dfa=deep_dfa, adapter=adapter, mode='global',
