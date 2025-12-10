@@ -74,14 +74,14 @@ class NRMSafetySequenceDataset(Dataset):
 
             episodes_tokens.append(tokens)
 
+        self.rows_per_seg = max(1, sequence_length // 4)
         indices = []
         for ep_idx, rows in enumerate(episodes_tokens):
             R = rows.shape[0]
-            rows_per_seg = max(1, min(sequence_length // 4, R - 1))
-            if R < rows_per_seg + 1:
+            if R < self.rows_per_seg + 1:
                 continue
-            starts = list(range(0, max(1, R - (rows_per_seg + 1)), rows_per_seg))
-            tail = R - (rows_per_seg + 1)
+            starts = list(range(0, max(1, R - (self.rows_per_seg + 1)), self.rows_per_seg))
+            tail = R - (self.rows_per_seg + 1)
             if tail not in starts:
                 starts.append(tail)
             for start_row in starts:
@@ -98,10 +98,9 @@ class NRMSafetySequenceDataset(Dataset):
         return len(self.indices)
 
     def __getitem__(self, idx):
-        ep_idx, start = self.indices[idx]
+        ep_idx, start_row = self.indices[idx]
         rows = self.episodes_tokens[ep_idx]
-        rows_per_seg = max(1, min(self.sequence_length // 4, rows.shape[0] - 1))
-        seg_rows = rows[start:start + rows_per_seg + 1]
+        seg_rows = rows[start_row:start_row + self.rows_per_seg + 1]
         flat = seg_rows.reshape(-1)
         x = torch.from_numpy(flat[:-4].astype(np.int64))
         y = torch.from_numpy(flat[4:].astype(np.int64))
