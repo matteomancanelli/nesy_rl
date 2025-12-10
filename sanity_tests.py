@@ -49,11 +49,11 @@ def test_adapter_and_dfa():
         include_value=True,
         use_stop_token=True,
     )
-    # simple DFA: accept if first symbol is s0_bin0
+    # simple DFA: accept if first symbol is s0_bin0 and end afterward
     dfa = adapter.create_dfa_from_ltl("s0_bin0", "test")
-    tokens = torch.tensor([[0, 0, adapter.num_token_ids - 1]])  # stop at end
+    tokens = torch.tensor([[0, adapter.num_token_ids - 1, adapter.num_token_ids - 1]])
     sat = adapter.batch_check_dfa_sat(tokens, dfa)
-    return {"adapter_num_tokens": adapter.num_token_ids, "sat": sat.item()}
+    return {"adapter_num_tokens": adapter.num_token_ids, "sat": sat.item(), "tokens": tokens.tolist()}
 
 
 def test_product_dfa():
