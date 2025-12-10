@@ -66,6 +66,12 @@ class NRMSafetySequenceDataset(Dataset):
                 tokens[t, 2] = 0  # reward placeholder
                 tokens[t, 3] = costs[t]  # cost signal
 
+            # append an end/stop transition
+            max_bin = max(self.env.observation_space.n, self.env.action_space.n, 2)
+            end_token = max_bin  # aligns with adapter.num_token_ids - 1
+            end_row = np.array([end_token] * 4, dtype=np.int64)
+            tokens = np.vstack([tokens, end_row])
+
             flat = tokens.reshape(-1)
             episodes_tokens.append(flat)
 
