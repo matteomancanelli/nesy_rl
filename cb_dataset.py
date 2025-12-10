@@ -76,15 +76,16 @@ class CBSequenceDataset(Dataset):
             end_row = np.array([end_token] * 4, dtype=np.int64)
             tokens = np.vstack([tokens, end_row])
 
-            episodes_tokens.append(tokens)
+            flat = tokens.reshape(-1)
+            episodes_tokens.append(flat)
 
         indices = []
-        for ep_idx, rows in enumerate(episodes_tokens):
-            L = rows.shape[0]
+        for ep_idx, flat in enumerate(episodes_tokens):
+            L = flat.shape[0]
             if L < sequence_length + 1:
                 continue
             starts = list(range(0, max(1, L - sequence_length), sequence_length))
-            last_start = L - sequence_length
+            last_start = L - (sequence_length + 1)
             if last_start not in starts:
                 starts.append(last_start)
             for start in starts:
@@ -102,10 +103,9 @@ class CBSequenceDataset(Dataset):
 
     def __getitem__(self, idx):
         ep_idx, start = self.indices[idx]
-        rows = self.episodes_tokens[ep_idx]
-        seg_rows = rows[start:start + self.sequence_length + 1]
-        flat = seg_rows.reshape(-1)
-        x = torch.from_numpy(flat[:-4].astype(np.int64))  # exclude last row for x
-        y = torch.from_numpy(flat[4:].astype(np.int64))   # shift by one row
+        flat = self.episodes_tokens[ep_idx]
+        seg = flat[start:start + self.sequence_length + 1]
+        x = torch.from_numpy(seg[:-1].astype(np.int64))
+        y = torch.from_numpy(seg[1:].astype(np.int64))
         mask = torch.ones_like(x, dtype=torch.float32)
         return x, y, mask
