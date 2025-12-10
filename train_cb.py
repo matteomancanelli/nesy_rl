@@ -49,14 +49,14 @@ def build_adapter_and_dfa(args, dataset):
         include_value=True,
         constraint_dims=args.constraint_dims,
         abstraction_fn=None,
-        use_stop_token=False,
+        use_stop_token=True,
     )
 
     if args.ltl_formula is None:
         raise ValueError("You must provide --ltl_formula")
 
     dfa = adapter.create_dfa_from_ltl(args.ltl_formula, "cb_constraint")
-    deep_dfa = DeepDFA.return_deep_dfa(dfa)
+    deep_dfa = dfa.return_deep_dfa()
     return adapter, deep_dfa
 
 
@@ -68,7 +68,7 @@ def build_model(args, dataset, vocab_size):
         pass
 
     cfg = Cfg()
-    cfg.vocab_size = vocab_size
+    cfg.vocab_size = vocab_size - 1
     cfg.block_size = args.block_size
     cfg.n_layer = args.n_layer
     cfg.n_head = args.n_head
@@ -94,9 +94,7 @@ def train(args):
         stochastic=args.stochastic, seed=args.seed
     )
 
-    loader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True, drop_last=True
-    )
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
 
     adapter, deep_dfa = build_adapter_and_dfa(args, dataset)
     model = build_model(args, dataset, vocab_size=adapter.num_token_ids)
@@ -117,9 +115,7 @@ def train(args):
 
         for batch in loader:
             batch = [b.to(device) for b in batch]
-            loss, sup_loss, logic_loss = logic.compute_loss(
-                model, batch, return_components=True
-            )
+            loss, sup_loss, logic_loss = logic.compute_loss(model, batch, return_components=True)
 
             opt.zero_grad()
             loss.backward()

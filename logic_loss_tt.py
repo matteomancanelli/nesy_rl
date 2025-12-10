@@ -152,8 +152,14 @@ class LogicLossModule:
         y = y.to(device)
         mask = mask.to(device)
 
-        logits, sup_loss = model(x, targets=y, mask=mask)
+        logits, _ = model(x)  # forward with targets=None, mask unused
         batch_size, seq_len, num_token_ids = logits.shape
+
+        sup_loss = F.cross_entropy(logits.view(-1, num_token_ids), y.view(-1), reduction="mean")
+
+        #logits, sup_loss = model(x, targets=y, mask=mask)
+        #logits, sup_loss = model(x, targets=y, mask=None)
+        #batch_size, seq_len, num_token_ids = logits.shape
 
         if num_token_ids != adapter.num_token_ids:
             raise ValueError(
