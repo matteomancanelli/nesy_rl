@@ -23,7 +23,7 @@ The training pipeline is environment-independent.
 To plug in a new environment, only two small components need to change:
 
 - Replace colour_bomb.py with your own environment
-- Replace cb_dataset.py with a module that interacrs with your environment and returns inputs for training
+- Replace cb_dataset.py with a module that interacts with your environment and returns input for training
 - Update the adapter configuration in train_cb.py (see function "build_adapter_and_dfa")
 
 Everything else in the pipeline is domain-agnostic.
