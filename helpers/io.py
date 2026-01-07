@@ -15,7 +15,6 @@ def save_json(path: str, obj: Dict[str, Any]) -> None:
 
 def save_npz(path: str, **arrays) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    # ensure CPU numpy
     out = {}
     for k, v in arrays.items():
         if torch.is_tensor(v):

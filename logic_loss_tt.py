@@ -42,7 +42,6 @@ class LogicLossModule:
         targets_flat = targets.reshape(B * T)
         mask_flat = mask.reshape(B * T).float()
 
-        # per-token loss
         loss_flat = F.cross_entropy(logits_flat, targets_flat, reduction="none")
         denom = mask_flat.sum().clamp(min=1.0)
         return (loss_flat * mask_flat).sum() / denom
@@ -72,8 +71,6 @@ class LogicLossModule:
         mask:    [B, T] (1 valid, 0 pad)
         """
         if stop_token_id is None:
-            # If you truly have no stop token, safest fallback is: keep samples
-            # as-is; but DFA will read padding as regular symbols (not ideal).
             return samples
 
         B, S, T, V = samples.shape

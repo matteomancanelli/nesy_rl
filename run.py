@@ -115,15 +115,11 @@ def train_one_run(
     deep_dfa = benchmark_assets.deep_dfa
     raw_dfa = benchmark_assets.raw_dfa
 
-    # IMPORTANT: your adapter reserves stop token as max_bin_id, but TT GPT expects vocab_size
-    # without that extra stop if you used that convention before.
-    # You were doing: vocab_size = adapter.num_token_ids - 1
     model, model_cfg = build_model(args, dataset, vocab_size=adapter.num_token_ids - 1, device=device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     # logic module
-    # Assumption: LogicLossModule exposes eps/clamp_acceptance in your current version.
     logic = LogicLossModule(
         deep_dfa=deep_dfa,
         adapter=adapter,
