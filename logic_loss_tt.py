@@ -1,240 +1,164 @@
 import torch
 import torch.nn.functional as F
-from pathlib import Path
-import sys
-
-REPO_ROOT = Path(__file__).parent
-sys.path.insert(0, str(REPO_ROOT / "suffix-prediction"))
-
-if torch.cuda.is_available():
-    device = "cuda:0"
-else:
-    device = "cpu"
-
 
 class LogicLossModule:
     """
     Logic-aware loss for Trajectory Transformer with Deep DFA constraints.
 
-    This module combines:
-        - a standard supervised loss (e.g. next-token cross-entropy from the model)
-        - a global logic loss derived from a Deep DFA that checks LTL constraints
-          over whole generated sequences.
+    Combines:
+      - supervised action/token prediction loss (masked)
+      - global logic loss based on DeepDFA acceptance over generated sequences
 
-    The core idea:
-        1) The model produces logits over token IDs for each position in the sequence.
-        2) We draw num_samples differentiable trajectories from these logits using
-           Gumbel-Softmax, obtaining soft one-hot token distributions.
-        3) The adapter maps token distributions to DFA symbol distributions.
-        4) The Deep DFA processes these symbol distributions and returns, for each
-           sampled trace, an acceptance probability.
-        5) We use a Monte-Carlo / importance-weighted estimator to approximate
-           P_theta(trace satisfies constraint), and define:
-
-               logic_loss = -log( E_{samples} [ acceptance ] )
-
-        6) The final training loss is a convex combination:
-
-               total_loss = (1 - alpha) * supervised_loss + alpha * logic_loss
-
-    This provides a differentiable way to inject global LTL constraints into
-    sequence model training.
+    Total:
+      total_loss = (1 - alpha) * sup_loss + alpha * logic_loss
     """
 
     def __init__(
-        self, deep_dfa, adapter, mode="global",
-        num_samples=10, temperature=0.5, alpha=0.4
+        self,
+        deep_dfa,
+        adapter,
+        mode="global",
+        num_samples=10,
+        temperature=0.5,
+        alpha=0.4,
+        eps=1e-10,
     ):
-        """
-        Initialize the logic loss module.
-
-        Args:
-            deep_dfa:
-                DeepDFA instance used to compute acceptance probabilities for
-                soft symbol sequences.
-            adapter:
-                TTDFAAdapter (or compatible) that maps token probabilities to
-                symbol probabilities for the DFA.
-            mode:
-                "global" for full-sequence logic loss (implemented),
-                "local" reserved for token-level constraints (not implemented).
-            num_samples:
-                number of Gumbel-Softmax samples per sequence.
-            temperature:
-                Gumbel-Softmax temperature; lower = sharper (closer to hard argmax),
-                higher = softer distributions.
-            alpha:
-                mixing coefficient in [0, 1] between supervised and logic loss.
-        """
-
-        self.deep_dfa = deep_dfa.to(device)
+        self.deep_dfa = deep_dfa
         self.adapter = adapter
         self.mode = mode
-        self.num_samples = num_samples
-        self.temperature = temperature
-        self.alpha = alpha
+        self.num_samples = int(num_samples)
+        self.temperature = float(temperature)
+        self.alpha = float(alpha)
+        self.eps = float(eps)
 
-    def _gumbel_softmax_samples(self, logits, num_samples, temperature):
+    def _masked_cross_entropy(self, logits, targets, mask):
         """
-        Draw differentiable samples from model logits using Gumbel-Softmax.
+        logits:  [B, T, V]
+        targets: [B, T]
+        mask:    [B, T]  (1 for valid positions, 0 for padding)
+        """
+        B, T, V = logits.shape
+        logits_flat = logits.reshape(B * T, V)
+        targets_flat = targets.reshape(B * T)
+        mask_flat = mask.reshape(B * T).float()
 
-        Args:
-            logits:
-                tensor of shape [batch_size, seq_len, num_token_ids], where
-                num_token_ids is the size of the model's token ID domain.
-            num_samples:
-                number of samples to draw per sequence.
-            temperature:
-                Gumbel-Softmax temperature parameter.
+        # per-token loss
+        loss_flat = F.cross_entropy(logits_flat, targets_flat, reduction="none")
+        denom = mask_flat.sum().clamp(min=1.0)
+        return (loss_flat * mask_flat).sum() / denom
 
+    def _gumbel_softmax_samples(self, logits):
+        """
+        logits: [B, T, V]
         Returns:
-            samples:
-                tensor of shape [batch_size, num_samples, seq_len, num_token_ids],
-                containing soft one-hot vectors over token IDs.
-            log_probs:
-                tensor of shape [batch_size, seq_len, num_token_ids], containing
-                log p(token_id | prefix) for each position.
+          samples:   [B, S, T, V]  (soft one-hots)
+          log_probs: [B, T, V]
         """
-
-        batch_size, seq_len, num_token_ids = logits.shape
+        B, T, V = logits.shape
         log_probs = F.log_softmax(logits, dim=-1)
-        logits_exp = logits.unsqueeze(1).expand(batch_size, num_samples, seq_len, num_token_ids)
-        samples = F.gumbel_softmax(logits_exp, tau=temperature, hard=False, dim=-1)
+
+        logits_exp = logits.unsqueeze(1).expand(B, self.num_samples, T, V)
+        samples = F.gumbel_softmax(
+            logits_exp, tau=self.temperature, hard=False, dim=-1
+        )
         return samples, log_probs
 
-    def global_logic_loss_tt(
-        self, model, batch, deep_dfa, adapter, num_samples=10,
-        temperature=0.5, alpha=0.4, return_components=False
-    ):
+    def _apply_stop_token_on_padding(self, samples, mask, stop_token_id):
         """
-        Compute global logic loss (and combine it with supervised loss) for a batch.
+        Force padded positions to be a deterministic STOP token distribution so
+        the DFA sees termination instead of arbitrary sampled tokens.
 
-        Steps:
-            1) Forward the model on inputs X to get logits and supervised loss.
-            2) Gumbel-softmax sampling:
-                   draw 'num_samples' soft trajectories from the logits.
-            3) Map token distributions to DFA symbol distributions via the adapter.
-            4) Feed symbol distributions to DeepDFA.forward_pi to obtain, for each
-               sampled trajectory, an acceptance probability.
-            5) Use a weighted Monte-Carlo estimator over samples to estimate
-               P_theta(trace satisfies constraint).
-            6) Define logic_loss = -log(mean_acceptance) and combine with supervised loss.
-
-        Args:
-            model:
-                neural model taking (X, targets=Y, mask=mask) and returning
-                (logits, supervised_loss).
-            batch:
-                (X, Y, mask) triple from the dataset.
-            deep_dfa:
-                DeepDFA instance (typically self.deep_dfa).
-            adapter:
-                adapter instance (typically self.adapter) for token->symbol mapping.
-            num_samples:
-                number of Gumbel-Softmax trajectories per sequence.
-            temperature:
-                Gumbel-Softmax temperature.
-            alpha:
-                mixing coefficient between supervised and logic loss.
-            return_components:
-                if True, return (total_loss, sup_loss, logic_loss) separately,
-                otherwise return only total_loss.
-
-        Returns:
-            total_loss or (total_loss, sup_loss, logic_loss).
+        samples: [B, S, T, V]
+        mask:    [B, T] (1 valid, 0 pad)
         """
+        if stop_token_id is None:
+            # If you truly have no stop token, safest fallback is: keep samples
+            # as-is; but DFA will read padding as regular symbols (not ideal).
+            return samples
 
+        B, S, T, V = samples.shape
+        dev = samples.device
+
+        # mask_valid: [B, 1, T, 1]
+        mask_valid = mask.to(dev).unsqueeze(1).unsqueeze(-1).float()
+
+        # one-hot stop: [1, 1, 1, V]
+        stop = torch.zeros((1, 1, 1, V), device=dev)
+        stop[..., stop_token_id] = 1.0
+
+        # Where mask==0 => replace with stop distribution
+        return samples * mask_valid + stop * (1.0 - mask_valid)
+
+    def global_logic_loss_tt(self, model, batch, return_components=False):
+        """
+        batch = (X, Y, mask)
+          X:    model inputs
+          Y:    token targets for supervised loss
+          mask: [B, T] valid positions
+        """
         if len(batch) != 3:
             raise ValueError(f"Expected batch to be (X, Y, mask); got length {len(batch)}")
 
         x, y, mask = batch
-        x = x.to(device)
-        y = y.to(device)
-        mask = mask.to(device)
 
-        logits, _ = model(x)  # forward with targets=None, mask unused
-        batch_size, seq_len, num_token_ids = logits.shape
+        # Forward pass
+        logits, sup_loss = model(x, targets=y, mask=mask)
 
-        sup_loss = F.cross_entropy(logits.view(-1, num_token_ids), y.view(-1), reduction="mean")
+        B, T, V = logits.shape
+        dev = logits.device
 
-        #logits, sup_loss = model(x, targets=y, mask=mask)
-        #logits, sup_loss = model(x, targets=y, mask=None)
-        #batch_size, seq_len, num_token_ids = logits.shape
+        x = x.to(dev)
+        y = y.to(dev)
+        mask = mask.to(dev)
 
-        if num_token_ids != adapter.num_token_ids:
+        if V != self.adapter.num_token_ids:
             raise ValueError(
-                f"Model logits last dim ({num_token_ids}) != adapter.num_token_ids ({adapter.num_token_ids})"
+                f"Model logits last dim ({V}) != adapter.num_token_ids ({self.adapter.num_token_ids})"
             )
 
-        samples, log_probs = self._gumbel_softmax_samples(
-            logits, num_samples=num_samples, temperature=temperature
-        )
-        # samples: [batch_size, num_samples, seq_len, num_token_ids]
-        traces_soft = samples.view(batch_size * num_samples, seq_len, num_token_ids)
+        # 1) Supervised loss (masked)
+        sup_loss = self._masked_cross_entropy(logits, y, mask)
 
-        sym_probs = adapter.token_probs_to_symbol_probs(traces_soft)
+        # 2) Gumbel-softmax samples
+        samples, _ = self._gumbel_softmax_samples(logits)  # [B, S, T, V]
 
-        deep_dfa = deep_dfa.to(device)
-        sym_probs = sym_probs.to(device)
+        # 3) Ensure padding positions correspond to STOP token for DFA purposes
+        stop_token_id = getattr(self.adapter, "stop_token_id", None)
+        samples = self._apply_stop_token_on_padding(samples, mask, stop_token_id)
 
-        dfa_states, dfa_rew_seq = deep_dfa.forward_pi(sym_probs)
+        # 4) Map token distributions -> DFA symbol distributions
+        traces_soft = samples.reshape(B * self.num_samples, T, V)
+        sym_probs = self.adapter.token_probs_to_symbol_probs(traces_soft).to(dev)
+
+        # 5) DeepDFA acceptance
+        deep_dfa = self.deep_dfa.to(dev)
+        _, dfa_rew_seq = deep_dfa.forward_pi(sym_probs)
         dfa_final = dfa_rew_seq[:, -1, :]
 
         if dfa_final.size(-1) < 2:
             raise ValueError("DeepDFA final reward has <2 outputs; expected [reject, accept].")
 
-        acceptance = dfa_final[:, 1]
-        acceptance = acceptance.view(batch_size, num_samples)
+        acceptance = dfa_final[:, 1].reshape(B, self.num_samples)
 
-        log_probs_exp = log_probs.unsqueeze(1).expand(batch_size, num_samples, seq_len, num_token_ids)
-        log_prob_traces = (samples * log_probs_exp).sum(dim=-1).sum(dim=-1)
+        # 6) Monte Carlo estimate (no importance weights)
+        prob_acceptance = acceptance.mean(dim=1)  # [B]
 
-        weights = F.softmax(log_prob_traces, dim=-1)
-        prob_acceptance = (weights * acceptance).sum(dim=-1)
+        logic_loss = -torch.log(prob_acceptance.clamp(min=self.eps)).mean()
 
-        eps = 1e-10
-        logic_loss = -torch.log(prob_acceptance.clamp(min=eps)).mean()
-
-        total_loss = (1.0 - alpha) * sup_loss + alpha * logic_loss
+        total_loss = (1.0 - self.alpha) * sup_loss + self.alpha * logic_loss
 
         if return_components:
             return total_loss, sup_loss, logic_loss
-        else:
-            return total_loss
+        return total_loss
 
     def local_logic_loss_tt(self, *args, **kwargs):
-        """
-        Placeholder for a local logic loss variant.
-
-        Not implemented. Use mode='global' instead.
-        """
-        raise NotImplementedError("Local logic loss for TT is not implemented yet. Use mode='global'.")
+        raise NotImplementedError(
+            "Local logic loss for TT is not implemented yet. Use mode='global'."
+        )
 
     def compute_loss(self, model, batch, return_components=False):
-        """
-        Dispatch to the appropriate logic loss computation based on self.mode.
-
-        Args:
-            model:
-                neural model to be trained.
-            batch:
-                data batch (X, Y, mask).
-            return_components:
-                if True, return (total_loss, sup_loss, logic_loss).
-
-        Returns:
-            total_loss or (total_loss, sup_loss, logic_loss), depending on return_components.
-
-        Raises:
-            ValueError if mode is not 'global' or 'local'.
-        """
-
         if self.mode == "global":
-            return self.global_logic_loss_tt(
-                model, batch, self.deep_dfa, self.adapter, num_samples=self.num_samples,
-                temperature=self.temperature, alpha=self.alpha, return_components=return_components
-            )
-        elif self.mode == "local":
+            return self.global_logic_loss_tt(model, batch, return_components=return_components)
+        if self.mode == "local":
             return self.local_logic_loss_tt()
-        else:
-            raise ValueError(f"Unknown mode: {self.mode}. Use 'global' or 'local'.")
+        raise ValueError(f"Unknown mode: {self.mode}. Use 'global' or 'local'.")

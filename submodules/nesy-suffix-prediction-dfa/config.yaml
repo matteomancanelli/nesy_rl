@@ -1,0 +1,22 @@
+root_path: /data/users/amezini/
+datasets: [BPIC_2020_travel, BPIC_2013_closed, sepsis]
+modes: [baseline, LLL]
+
+template_type: all
+template_support: 85-100
+
+noise_levels: ['02', '03', '04']
+portion: 1
+
+nr_runs: 15
+
+hidden_dim: 100
+nr_epochs: 2000
+min_epochs: 500
+alpha_levels: [0.75]
+temperature: 0.7
+batch_size: 64
+
+patience: 35
+min_delta: 0.00001
+min_loss: 0.01

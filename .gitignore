@@ -1,7 +1,7 @@
 __pycache__/
 .vscode/
 
+data_cache*/
 simpleDFAs*/
 symbolicDFAs*/
 runs*/
-tmp*/
