@@ -7,3 +7,6 @@
 [submodule "trajectory-transformer"]
 	path = trajectory-transformer
 	url = https://github.com/jannerm/trajectory-transformer
+[submodule "decision-transformer"]
+	path = decision-transformer
+	url = https://github.com/kzl/decision-transformer
