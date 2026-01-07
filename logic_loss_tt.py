@@ -18,7 +18,7 @@ class LogicLossModule:
         deep_dfa,
         adapter,
         mode="global",
-        num_samples=10,
+        num_samples=8,
         temperature=0.5,
         alpha=0.4,
         eps=1e-10,

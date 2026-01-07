@@ -51,6 +51,7 @@ class TTDFAAdapter:
 
         self.symbolic_vocab = []
         self.symbol_to_idx = {}
+        self._mapping_cache = {}
         self.pos_bin_to_sym_idx = torch.empty(self.transition_dim, self.num_token_ids, dtype=torch.long)
 
         self._build_symbolic_vocab_and_mapping()
@@ -110,27 +111,27 @@ class TTDFAAdapter:
         for b in range(B):
             out.append([self.symbolic_vocab[int(i)] for i in sym_idx[b]])
         return out[0] if B == 1 else out
-
+    
     def token_probs_to_symbol_probs(self, token_probs: torch.Tensor) -> torch.Tensor:
-        """
-        token_probs: [B, T, V=num_token_ids]
-        sym_probs:   [B, T, S=num_symbols]
-        Vectorized (no Python loop over T).
-        """
         if token_probs.size(-1) != self.num_token_ids:
-            raise ValueError(f"token_probs last dim {token_probs.size(-1)} != num_token_ids {self.num_token_ids}")
+            raise ValueError(...)
 
         B, T, V = token_probs.shape
         device = token_probs.device
+        cache_key = (T, str(device))
 
-        pos = (torch.arange(T, device=device) % self.transition_dim)          # [T]
-        mapping = self.pos_bin_to_sym_idx.to(device)[pos]                     # [T, V]
-        mapping_bt = mapping.unsqueeze(0).expand(B, T, V).reshape(B * T, V)    # [B*T, V]
+        mapping = self._mapping_cache.get(cache_key, None)
+        if mapping is None:
+            pos = (torch.arange(T, device=device) % self.transition_dim)     # [T]
+            mapping = self.pos_bin_to_sym_idx.to(device)[pos]                # [T, V]
+            self._mapping_cache[cache_key] = mapping
 
+        # expand + scatter-add as before
+        mapping_bt = mapping.unsqueeze(0).expand(B, T, V).reshape(B * T, V)
         tp = token_probs.reshape(B * T, V)
+
         sym_probs = tp.new_zeros((B * T, self.num_symbols))
         sym_probs.scatter_add_(1, mapping_bt, tp)
-
         return sym_probs.reshape(B, T, self.num_symbols)
 
     def create_dfa_from_ltl(self, ltl_formula, formula_name="constraint"):
