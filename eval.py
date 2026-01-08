@@ -47,7 +47,7 @@ def main():
     assets = bench.build_assets(args)
 
     # build model with correct vocab convention
-    model, _cfg = build_model(args, assets.dataset, vocab_size=assets.adapter.num_token_ids - 1, device=device)
+    model, _cfg = build_model(args, assets.dataset, vocab_size=assets.adapter.num_token_ids, device=device)
 
     ckpt_path = os.path.join(args.run_dir, "checkpoint.pt")
     if not os.path.exists(ckpt_path):

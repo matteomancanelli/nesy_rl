@@ -147,15 +147,60 @@ class LogicLossModule:
         if return_components:
             return total_loss, sup_loss, logic_loss
         return total_loss
+    
+    def local_logic_loss_tt(self, model, batch, return_components=False):
+        if len(batch) != 3:
+            raise ValueError(f"Expected batch to be (X, Y, mask); got length {len(batch)}")
 
-    def local_logic_loss_tt(self, *args, **kwargs):
-        raise NotImplementedError(
-            "Local logic loss for TT is not implemented yet. Use mode='global'."
-        )
+        x, y, mask = batch
+        logits, _ = model(x, targets=y, mask=mask)
+
+        B, T, V = logits.shape
+        dev = logits.device
+
+        if V != self.adapter.num_token_ids:
+            raise ValueError(
+                f"Model logits last dim ({V}) != adapter.num_token_ids ({self.adapter.num_token_ids})"
+            )
+
+        # supervised
+        sup_loss = self._masked_cross_entropy(logits, y, mask)
+
+        # samples
+        samples, _ = self._gumbel_softmax_samples(logits)  # [B, S, T, V]
+        stop_token_id = getattr(self.adapter, "stop_token_id", None)
+        samples = self._apply_stop_token_on_padding(samples, mask, stop_token_id)
+
+        traces_soft = samples.reshape(B * self.num_samples, T, V)
+        sym_probs = self.adapter.token_probs_to_symbol_probs(traces_soft).to(dev)
+
+        deep_dfa = self.deep_dfa.to(dev)
+        _, dfa_rew_seq = deep_dfa.forward_pi(sym_probs)  # [B*S, T, 2] in your assumption
+
+        if dfa_rew_seq.size(-1) < 2:
+            raise ValueError("DeepDFA reward seq has <2 outputs; expected [reject, accept].")
+
+        # acceptance per step
+        acc_seq = dfa_rew_seq[:, :, 1]  # [B*S, T]
+
+        # Apply mask: we only care about valid positions
+        # mask is [B,T] -> expand to [B,S,T] -> reshape to [B*S,T]
+        mask_bs = mask.to(dev).unsqueeze(1).expand(B, self.num_samples, T).reshape(B * self.num_samples, T).float()
+
+        # local loss = avg over time and samples
+        local_loss_per_pos = -torch.log(acc_seq.clamp(min=self.eps))  # [B*S,T]
+        local_loss = (local_loss_per_pos * mask_bs).sum() / mask_bs.sum().clamp(min=1.0)
+
+        total_loss = (1.0 - self.alpha) * sup_loss + self.alpha * local_loss
+
+        if return_components:
+            return total_loss, sup_loss, local_loss
+        return total_loss
+
 
     def compute_loss(self, model, batch, return_components=False):
         if self.mode == "global":
             return self.global_logic_loss_tt(model, batch, return_components=return_components)
         if self.mode == "local":
-            return self.local_logic_loss_tt()
+            return self.local_logic_loss_tt(model, batch, return_components=return_components)
         raise ValueError(f"Unknown mode: {self.mode}. Use 'global' or 'local'.")

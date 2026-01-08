@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import sys
+import numpy as np
 from typing import Any, Dict, Optional
 
 import torch
@@ -101,6 +102,109 @@ def eval_model(
     return metrics
 
 
+@torch.no_grad()
+def rollout_eval_cb(
+    model,
+    env,
+    adapter,
+    device: torch.device,
+    n_episodes: int = 50,
+    max_steps: int = None,
+    model_kind: str = "tt",
+    v_bins: int = 1,
+    dt_target_vtoken: int = None,
+):
+    """
+    Closed-loop rollout evaluation for Colour Bomb.
+
+    Important: your model is trained to predict the next *row* (shift by transition_dim).
+    So to predict action a_t, we read logits at the position corresponding to a_{t-1}.
+    For t=0 we bootstrap with a dummy previous row.
+    """
+    model.eval()
+    if max_steps is None:
+        max_steps = env.cfg.max_steps
+
+    # choose conditioning v token
+    if model_kind == "dt":
+        if dt_target_vtoken is None:
+            dt_target_vtoken = max(0, int(v_bins) - 1)
+        v_tok = int(dt_target_vtoken)
+    else:
+        v_tok = 0
+
+    returns = []
+    sats = []
+
+    stop_id = getattr(adapter, "stop_token_id", None)
+    if stop_id is None:
+        stop_id = adapter.max_num_bins  # fallback
+
+    for ep in range(n_episodes):
+        s, _ = env.reset()
+        ep_ret = 0.0
+
+        # history of rows [s,a,r,v] as integers
+        rows = []
+
+        # bootstrap "previous row" so we can query a_0 from logits at a_{-1}
+        # pick a dummy prev action 0 and reward token 0 (your datasets use r=0 tokens anyway)
+        rows.append([int(s), 0, 0, v_tok])
+
+        done = False
+        for t in range(max_steps):
+            # build context tokens
+            flat = np.array(rows, dtype=np.int64).reshape(-1)
+            # truncate to last block_size tokens if needed
+            # (model cfg block_size is args.block_size; we’ll just keep last adapter-aligned suffix)
+            x = torch.from_numpy(flat).to(device).long()
+            if x.numel() > model.cfg.block_size:
+                x = x[-model.cfg.block_size:]
+
+            # mask/targets are dummy (we only need logits)
+            mask = torch.ones_like(x, dtype=torch.float32, device=device)
+            # make a fake y of same length (not used)
+            y = torch.zeros_like(x, device=device)
+
+            logits, _ = model(x.unsqueeze(0), targets=y.unsqueeze(0), mask=mask.unsqueeze(0))
+
+            # find index of "a_{t-1}" in the current x
+            # rows[-1] is the previous row; action is position 1 within row
+            # in flat history, index of previous action is (len(rows)-1)*4 + 1
+            idx_in_full = (len(rows) - 1) * adapter.transition_dim + 1
+            # after truncation, shift
+            idx_in_x = idx_in_full - (flat.size - x.numel())
+            idx_in_x = int(np.clip(idx_in_x, 0, x.numel() - 1))
+
+            a_logits = logits[0, idx_in_x, :]  # [V]
+            a = int(torch.argmax(a_logits).item())
+
+            # step env with predicted action
+            ns, r, done, _info = env.step(a)
+            ep_ret += float(r)
+
+            # append the executed transition row (reward token still 0)
+            rows.append([int(ns), int(a), 0, int(v_tok)])
+            s = ns
+            if done:
+                break
+
+        # build token sequence and check DFA sat (append stop row)
+        tok = np.array(rows, dtype=np.int64)
+        end_row = np.array([[stop_id] * adapter.transition_dim], dtype=np.int64)
+        tok = np.vstack([tok, end_row])
+        flat_tok = torch.from_numpy(tok.reshape(-1)).unsqueeze(0).to(device)
+
+        if hasattr(env, "cfg"):
+            pass  # placeholder; env exists
+
+        # raw_dfa may be list; caller will handle. Here we just return the trace.
+        returns.append(ep_ret)
+        sats.append(flat_tok)
+
+    return returns, sats
+
+
 def train_one_run(
     args,
     benchmark_assets,
@@ -115,7 +219,7 @@ def train_one_run(
     deep_dfa = benchmark_assets.deep_dfa
     raw_dfa = benchmark_assets.raw_dfa
 
-    model, model_cfg = build_model(args, dataset, vocab_size=adapter.num_token_ids - 1, device=device)
+    model, model_cfg = build_model(args, dataset, vocab_size=adapter.num_token_ids, device=device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
@@ -123,7 +227,7 @@ def train_one_run(
     logic = LogicLossModule(
         deep_dfa=deep_dfa,
         adapter=adapter,
-        mode="global",
+        mode=getattr(args, "logic_mode", "global"),
         num_samples=args.num_samples,
         temperature=args.temperature,
         alpha=alpha,
@@ -208,6 +312,38 @@ def train_one_run(
                 max_batches=args.eval_max_batches,
             )
             train_row.update({f"val_{k}": v for k, v in val_metrics.items()})
+
+            # optional rollout eval (CB only)
+            if getattr(args, "rollout_eval", False) and getattr(args, "benchmark", "") == "cb":
+                env = dataset.env
+                rets, traces = rollout_eval_cb(
+                    model=model,
+                    env=env,
+                    adapter=adapter,
+                    device=device,
+                    n_episodes=getattr(args, "rollout_episodes", 50),
+                    max_steps=getattr(args, "rollout_max_steps", None),
+                    model_kind=getattr(args, "model", "tt"),
+                    v_bins=getattr(args, "v_bins", 1),
+                    dt_target_vtoken=getattr(args, "dt_target_vtoken", None),
+                )
+
+                # compute DFA satisfaction for each rollout trace
+                sat_list = []
+                for flat_tok in traces:
+                    preds = flat_tok
+
+                    if isinstance(raw_dfa, (list, tuple)):
+                        sats = [adapter.batch_check_dfa_sat(preds, d, device=str(device)) for d in raw_dfa]
+                        sat = torch.stack(sats, dim=0).min(dim=0).values
+                    else:
+                        sat = adapter.batch_check_dfa_sat(preds, raw_dfa, device=str(device))
+                    sat_list.append(float(sat.item()))
+
+                val_metrics["rollout_return_mean"] = float(np.mean(rets))
+                val_metrics["rollout_return_std"] = float(np.std(rets))
+                val_metrics["rollout_satisfaction_rate"] = float(np.mean(sat_list))
+
 
         history.append(train_row)
         save_json(os.path.join(out_dir, "history.json"), {"rows": history})

@@ -18,6 +18,8 @@ class CBSequenceDataset(Dataset):
         sequence_length=200,
         discount=0.99,
         stochastic=False,
+        v_bins=1, 
+        model="tt",
         seed=0,
         dataset_path=None,
     ):
@@ -30,6 +32,8 @@ class CBSequenceDataset(Dataset):
         self.observation_dim = 1
         self.action_dim = 1
         self.joined_dim = 4
+        self.v_bins = int(v_bins)
+        self.model = str(model)
 
         self.rows_per_seg = max(1, self.sequence_length // self.joined_dim)
 
@@ -72,8 +76,35 @@ class CBSequenceDataset(Dataset):
             tokens[:, 2] = 0
             tokens[:, 3] = 0
 
+            if self.model == "dt":
+                # discounted return-to-go
+                rtg = np.zeros(T, dtype=np.float32)
+                running = 0.0
+                for t in reversed(range(T)):
+                    running = rewards[t] + self.discount * running
+                    rtg[t] = running
+
+                # discretize RTG into v_bins
+                # Use a stable range based on env rewards
+                cfg = self.env.cfg
+                rtg_min = cfg.bomb_reward + cfg.step_reward * cfg.max_steps
+                rtg_max = cfg.goal_reward + cfg.step_reward  # approx upper bound
+
+                # avoid degenerate ranges
+                lo, hi = float(rtg_min), float(rtg_max)
+                if hi <= lo + 1e-6:
+                    lo, hi = float(rtg.min()), float(rtg.max()) + 1e-6
+
+                # map to [0, v_bins-1]
+                vb = max(2, self.v_bins)
+                scaled = (rtg - lo) / (hi - lo)
+                v_tok = np.floor(scaled * vb).astype(np.int64)
+                v_tok = np.clip(v_tok, 0, vb - 1)
+                tokens[:, 3] = v_tok
+
             # append stop row (same token id for all dims)
-            max_bin = max(self.env.observation_space.n, self.env.action_space.n, 1)
+            max_bin = max(self.env.observation_space.n, self.env.action_space.n, self.v_bins, 1)
+
             end_token = max_bin
             end_row = np.array([end_token] * 4, dtype=np.int64)
             tokens = np.vstack([tokens, end_row])

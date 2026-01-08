@@ -28,7 +28,22 @@ class ColourBombBenchmark:
         # cache path (optional)
         dataset_path = None
         if getattr(args, "dataset_cache_dir", None):
-            dataset_path = f"{args.dataset_cache_dir}/cb_ep{args.num_episodes}_ms{args.max_steps}_seed{args.seed}.npz"
+            #dataset_path = f"{args.dataset_cache_dir}/cb_ep{args.num_episodes}_ms{args.max_steps}_seed{args.seed}.npz"
+            model = getattr(args, "model", "tt")
+            v_bins = getattr(args, "v_bins", 1)
+            stoch = int(bool(getattr(args, "stochastic", False)))
+            disc = float(getattr(args, "discount", 0.99))
+
+            dataset_path = (
+                f"{args.dataset_cache_dir}/cb_{model}"
+                f"_vb{v_bins}"
+                f"_ep{args.num_episodes}"
+                f"_ms{args.max_steps}"
+                f"_disc{disc:.4f}"
+                f"_st{stoch}"
+                f"_seed{args.seed}.npz"
+            )
+
 
         return CBSequenceDataset(
             num_episodes=args.num_episodes,
@@ -38,6 +53,8 @@ class ColourBombBenchmark:
             stochastic=args.stochastic,
             seed=args.seed,
             dataset_path=dataset_path,
+            v_bins=getattr(args, "v_bins", 1),
+            model=getattr(args, "model", "tt")
         )
 
     def make_adapter_and_dfa(self, args, dataset):
@@ -46,7 +63,8 @@ class ColourBombBenchmark:
         obs_bins = env.observation_space.n
         act_bins = env.action_space.n
         rew_bins = 1
-        val_bins = 1
+        val_bins = getattr(args, "v_bins", 1)
+
 
         adapter = TTDFAAdapter(
             observation_dim=dataset.observation_dim,

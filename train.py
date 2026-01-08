@@ -2,10 +2,10 @@
 import argparse
 import os
 import torch
+import copy
 
 from benchmarks import get_benchmark
 from run import train_one_run
-
 
 def get_arg_parser():
     p = argparse.ArgumentParser()
@@ -38,7 +38,7 @@ def get_arg_parser():
     p.add_argument("--reward_weight", type=float, default=1.0)
     p.add_argument("--value_weight", type=float, default=1.0)
 
-    # dataset/env generation knobs used by your toy datasets
+    # dataset/env generation knobs used by toy datasets
     p.add_argument("--num_episodes", type=int, default=2000)
     p.add_argument("--max_steps", type=int, default=200)
     p.add_argument("--discount", type=float, default=0.99)
@@ -62,24 +62,49 @@ def get_arg_parser():
     p.add_argument("--save_traces", action="store_true")
     p.add_argument("--dataset_cache_dir", type=str, default="data_cache")
 
-    return p
+    p.add_argument("--models", nargs="*", default=["tt"], choices=["tt", "dt"],
+        help="Which models to run. Default: tt. Use: --models tt dt")
+    p.add_argument("--logic_mode", type=str, default="global", choices=["global", "local"])
+    p.add_argument("--v_bins", type=int, default=1, help="Number of bins for v. For DT, set e.g. 50 or 100.")
 
+    p.add_argument("--rollout_eval", action="store_true",
+               help="If set, run closed-loop env rollouts during eval (CB only for now).")
+    p.add_argument("--rollout_episodes", type=int, default=50)
+    p.add_argument("--rollout_max_steps", type=int, default=None,
+                help="Override env max_steps for rollout eval if set.")
+    p.add_argument("--dt_target_vtoken", type=int, default=None,
+                help="For DT rollouts: fixed v-token to condition on (default: v_bins-1).")
+
+    return p
 
 def main():
     args = get_arg_parser().parse_args()
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    bench = get_benchmark(args.benchmark)
-    assets = bench.build_assets(args)
+    for model_name in args.models:
+        args_m = copy.deepcopy(args)
+        args_m.model = model_name
 
-    tag = args.run_name or f"{args.benchmark}_seed{args.seed}"
-    base = os.path.join(args.out_root, tag)
+        if model_name == "dt":
+            if args_m.v_bins <= 1:
+                args_m.v_bins = 50  # default RTG bins
+            args_m.reward_weight = 0.0
+            args_m.value_weight = 0.0
+            args_m.action_weight = 1.0
 
-    # A) vanilla TT
-    train_one_run(args, assets, out_dir=os.path.join(base, "vanilla"), alpha=0.0, device=device)
+        bench = get_benchmark(args_m.benchmark)
+        assets = bench.build_assets(args_m)
 
-    # B) TT + global logic loss
-    train_one_run(args, assets, out_dir=os.path.join(base, f"gll_alpha_{args.alpha}"), alpha=args.alpha, device=device)
+        tag = args_m.run_name or f"{args_m.benchmark}_{model_name}_seed{args_m.seed}"
+        base = os.path.join(args_m.out_root, tag)
+
+        # A) vanilla
+        train_one_run(args_m, assets, out_dir=os.path.join(base, "vanilla"),
+                      alpha=0.0, device=device)
+
+        # B) logic-regularized
+        train_one_run(args_m, assets, out_dir=os.path.join(base, f"{args_m.logic_mode}_alpha_{args_m.alpha}"),
+                      alpha=args_m.alpha, device=device)
 
 
 if __name__ == "__main__":
